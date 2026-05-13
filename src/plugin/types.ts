@@ -183,9 +183,10 @@ export type PluginDoctorContext = {
   readonly agentDir: string
   readonly config: unknown
   readonly logger: PluginLogger
+  readonly signal: AbortSignal
 }
 
-export type PluginCheckStatus = 'ok' | 'warning' | 'error'
+export type PluginCheckStatus = 'ok' | 'warning' | 'error' | 'info'
 
 export type PluginCheckResult = {
   status: PluginCheckStatus

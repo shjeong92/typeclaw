@@ -1,3 +1,7 @@
+import { join } from 'node:path'
+
+import lockfile from 'proper-lockfile'
+
 import { findAgentDir } from '@/init'
 import type { DoctorCheckPayload } from '@/shared'
 
@@ -45,8 +49,10 @@ export type RunDoctorOptions = {
 }
 
 export async function runDoctor(opts: RunDoctorOptions = {}): Promise<DoctorRunResult> {
-  const cwd = opts.cwd ?? findAgentDir(process.cwd()) ?? process.cwd()
-  const hasAgentFolder = findAgentDir(cwd) === cwd
+  const startCwd = opts.cwd ?? process.cwd()
+  const agentDir = findAgentDir(startCwd)
+  const cwd = agentDir ?? startCwd
+  const hasAgentFolder = agentDir !== null
   const ctx: CheckContext = { cwd, hasAgentFolder }
 
   const staticChecks = (opts.staticChecks ?? buildStaticChecks()).filter((c) => isAllowed(c, opts.only, c.category))
@@ -61,20 +67,41 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<DoctorRunR
     return { initial }
   }
 
-  const fetchPluginFix = opts.fetchPluginFix ?? defaultFetchPluginDoctorFix
-  const attempts: FixAttempt[] = []
-  attempts.push(...(await runStaticFixes(staticResults, ctx)))
-  attempts.push(...(await runPluginFixes(pluginResults.entries, fetchPluginFix, ctx)))
+  const release = hasAgentFolder ? await acquireFixLock(cwd) : null
+  try {
+    const fetchPluginFix = opts.fetchPluginFix ?? defaultFetchPluginDoctorFix
+    const attempts: FixAttempt[] = []
+    attempts.push(...(await runStaticFixes(staticResults, ctx)))
+    attempts.push(...(await runPluginFixes(pluginResults.entries, fetchPluginFix, ctx)))
 
-  const commit = hasAgentFolder
-    ? await commitAutoFixes({ cwd, attempts, ...(opts.spawnGit !== undefined ? { spawnGit: opts.spawnGit } : {}) })
-    : { kind: 'skipped' as const, reason: 'no agent folder; nothing to commit' }
+    const commit = hasAgentFolder
+      ? await commitAutoFixes({
+          cwd,
+          attempts,
+          ...(opts.spawnGit !== undefined ? { spawnGit: opts.spawnGit } : {}),
+        })
+      : { kind: 'skipped' as const, reason: 'no agent folder; nothing to commit' }
 
-  const finalStaticResults = await runStaticChecks(staticChecks, ctx)
-  const finalPluginResults = await collectPluginChecks(fetchPluginChecks, ctx, opts.only)
-  const final = buildReport(ctx, finalStaticResults, finalPluginResults)
+    const finalStaticResults = await runStaticChecks(staticChecks, ctx)
+    const finalPluginResults = await collectPluginChecks(fetchPluginChecks, ctx, opts.only)
+    const final = buildReport(ctx, finalStaticResults, finalPluginResults)
 
-  return { initial, fixAttempts: attempts, commit, final }
+    return { initial, fixAttempts: attempts, commit, final }
+  } finally {
+    if (release !== null) {
+      try {
+        await release()
+      } catch {}
+    }
+  }
+}
+
+async function acquireFixLock(cwd: string): Promise<() => Promise<void>> {
+  const lockTarget = join(cwd, 'typeclaw.json')
+  return lockfile.lock(lockTarget, {
+    realpath: false,
+    retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
+  })
 }
 
 type StaticResult = {
@@ -272,16 +299,34 @@ async function runPluginFixes(
 
 // Defense in depth: even though the container-side runner sanitizes
 // changedPaths, re-validate on the host before `git add` so a future protocol
-// change cannot bypass the security boundary by accident.
+// change cannot bypass the security boundary by accident. The rules here MUST
+// stay identical to `sanitizeChangedPaths` in `src/agent/doctor.ts`.
 function sanitizeChangedPathsForHost(_cwd: string, paths: readonly string[]): string[] {
   const out: string[] = []
   for (const raw of paths) {
     if (typeof raw !== 'string' || raw.length === 0) continue
-    if (raw.startsWith('/') || raw.includes('\\')) continue
-    if (raw.split('/').includes('..')) continue
-    out.push(raw)
+    if (raw.includes('\0') || raw.includes('\\')) continue
+    if (raw.startsWith('/')) continue
+    const stripped = posixNormalize(raw).replace(/\/+$/, '')
+    if (stripped === '.' || stripped === '' || stripped.startsWith('..')) continue
+    if (stripped.split('/').includes('..')) continue
+    out.push(stripped)
   }
   return out
+}
+
+function posixNormalize(p: string): string {
+  const segments = p.split('/').filter((s) => s.length > 0 && s !== '.')
+  const stack: string[] = []
+  for (const seg of segments) {
+    if (seg === '..') {
+      if (stack.length === 0) return '..'
+      stack.pop()
+      continue
+    }
+    stack.push(seg)
+  }
+  return stack.join('/') || '.'
 }
 
 export type { Severity }

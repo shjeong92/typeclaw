@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -115,16 +115,7 @@ function agentFolderRequiredDirs(): DoctorCheck {
         message: `${missing.length} required ${missing.length === 1 ? 'directory' : 'directories'} missing`,
         details: missing.map((d) => `missing: ${d}/`),
         fix: {
-          description: `Create the missing directories (${missing.map((d) => `${d}/`).join(', ')}).`,
-          autoFix: async () => {
-            for (const d of missing) {
-              mkdirSync(join(ctx.cwd, d), { recursive: true })
-            }
-            return {
-              summary: `created ${missing.map((d) => `${d}/`).join(', ')}`,
-              changedPaths: missing.map((d) => `${d}/`),
-            }
-          },
+          description: `Create the missing directories: ${missing.map((d) => `${d}/`).join(', ')}. Most are gitignored, so \`typeclaw doctor --fix\` does not auto-create them; \`typeclaw start\` will scaffold them on next run.`,
         },
       }
     },
@@ -146,16 +137,12 @@ function agentFolderDockerfileTemplate(): DoctorCheck {
       const actual = await safeRead(dockerfilePath)
       if (actual === expected) return { status: 'ok', message: 'Dockerfile matches template' }
       return {
-        status: 'warning',
+        status: 'info',
         message: actual === null ? 'Dockerfile missing' : 'Dockerfile diverges from template',
-        details: ['The Dockerfile is regenerated on every `typeclaw start`, so a divergent file will be overwritten.'],
-        fix: {
-          description: 'Regenerate the Dockerfile from the typeclaw template.',
-          autoFix: async () => {
-            await writeAtomic(dockerfilePath, expected)
-            return { summary: 'refreshed Dockerfile from template', changedPaths: [DOCKERFILE] }
-          },
-        },
+        details: [
+          'The Dockerfile is gitignored and regenerated on every `typeclaw start` from the template.',
+          'Run `typeclaw start --build` to refresh it now.',
+        ],
       }
     },
   }
@@ -418,7 +405,9 @@ async function safeRead(path: string): Promise<string | null> {
 }
 
 async function writeAtomic(path: string, content: string): Promise<void> {
-  await writeFile(path, content)
+  const tmp = `${path}.typeclaw-doctor.tmp`
+  await writeFile(tmp, content)
+  renameSync(tmp, path)
 }
 
 export function relativeToCwd(cwd: string, path: string): string {

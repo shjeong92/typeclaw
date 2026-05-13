@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -236,7 +236,7 @@ test('buildCommitMessage formats subject + bullets', async () => {
   expect(msg).toContain('- [plugin] memory.daily-stream-current: created memory/2026-05-12.md')
 })
 
-test('readme example: report.entries preserves source distinction', async () => {
+test('report.entries preserves source distinction (static vs plugin)', async () => {
   const cwd = makeTmpAgentDir()
   const result = await runDoctor({
     cwd,
@@ -258,5 +258,135 @@ test('readme example: report.entries preserves source distinction', async () => 
   })
   const sources = result.initial.entries.map((e) => e.source)
   expect(sources).toEqual(['static', 'plugin'])
-  expect(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')).toBeDefined()
+})
+
+test('--only filter excludes static checks outside the allowlist', async () => {
+  const cwd = makeTmpAgentDir()
+  const result = await runDoctor({
+    cwd,
+    only: ['docker'],
+    staticChecks: [
+      { ...fakeCheck('docker.x', 'ok'), category: 'docker' },
+      { ...fakeCheck('config.x', 'warning'), category: 'config' },
+    ],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  const names = result.initial.entries.map((e) => e.name)
+  expect(names).toEqual(['docker.x'])
+})
+
+test('--only filter keeps plugin checks when "plugin" is in the list', async () => {
+  const cwd = makeTmpAgentDir()
+  const result = await runDoctor({
+    cwd,
+    only: ['plugin'],
+    staticChecks: [{ ...fakeCheck('config.x', 'ok'), category: 'config' }],
+    fetchPluginChecks: async () => ({
+      kind: 'ok',
+      checks: [
+        {
+          id: 'm.y',
+          pluginName: 'm',
+          checkName: 'y',
+          description: 'y',
+          category: 'plugin:m',
+          status: 'ok',
+          message: 'ok',
+        },
+      ],
+    }),
+  })
+  const names = result.initial.entries.map((e) => e.name)
+  expect(names).toEqual(['y'])
+})
+
+test('records autoFix throws as a failed fix attempt and skips the commit', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  const throwing: import('./types').DoctorCheck = {
+    name: 'throws',
+    category: 'config',
+    description: 'throws',
+    async run() {
+      return {
+        status: 'warning',
+        message: 'broken',
+        fix: {
+          description: 'will throw',
+          autoFix: async () => {
+            throw new Error('disk full')
+          },
+        },
+      }
+    },
+  }
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [throwing],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.fixAttempts?.[0]).toMatchObject({ ok: false, name: 'throws', source: 'static' })
+  expect(result.commit?.kind).toBe('skipped')
+})
+
+test('skips commit when no fix produced any changedPaths', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  const noPathFix: import('./types').DoctorCheck = {
+    name: 'no-paths',
+    category: 'config',
+    description: 'no paths',
+    async run() {
+      return {
+        status: 'warning',
+        message: 'x',
+        fix: {
+          description: 'no-op fix',
+          autoFix: async () => ({ summary: 'no-op', changedPaths: [] }),
+        },
+      }
+    },
+  }
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [noPathFix],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.commit?.kind).toBe('skipped')
+  expect(result.commit?.kind === 'skipped' && result.commit.reason).toMatch(/no changed paths/)
+})
+
+test('refuses commit when git index already has unrelated staged changes', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  writeFileSync(join(cwd, 'unrelated.txt'), 'user-staged change', 'utf8')
+  await run(['git', 'add', 'unrelated.txt'], cwd)
+
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [fakeCheck('alpha', 'warning', { autoFix: true })],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+
+  expect(result.commit?.kind).toBe('skipped')
+  expect(result.commit?.kind === 'skipped' && result.commit.reason).toMatch(/index is not clean/)
+
+  const log = await run(['git', 'log', '--format=%s'], cwd)
+  expect(log.stdout.split('\n').filter(Boolean)).toEqual(['init'])
+})
+
+test('reaches into agent folder when invoked from a subdir of the agent', async () => {
+  const cwd = makeTmpAgentDir()
+  const subdir = join(cwd, 'workspace')
+  mkdirSync(subdir, { recursive: true })
+  const result = await runDoctor({
+    cwd: subdir,
+    staticChecks: [fakeCheck('alpha', 'ok')],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.initial.hasAgentFolder).toBe(true)
+  expect(result.initial.cwd).toBe(cwd)
 })

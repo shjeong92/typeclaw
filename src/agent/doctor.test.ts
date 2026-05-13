@@ -66,6 +66,21 @@ describe('runPluginDoctorChecks', () => {
     expect(record?.message).toMatch(/timed out/)
   })
 
+  test('aborts the check signal when the timeout fires', async () => {
+    const registry = emptyRegistry()
+    let captured: AbortSignal | undefined
+    registerCheck(registry, 'p1', 'observes-signal', {
+      description: 'x',
+      run: (ctx) =>
+        new Promise<PluginCheckResult>(() => {
+          captured = ctx.signal
+        }),
+    })
+    const [record] = await runPluginDoctorChecks({ registry, agentDir: '/agent', checkTimeoutMs: 20 })
+    expect(captured?.aborted).toBe(true)
+    expect(record?.message).toMatch(/timed out/)
+  })
+
   test('reports fix.hasApply: true only when apply is present', async () => {
     const registry = emptyRegistry()
     registerCheck(registry, 'p1', 'with-apply', {
@@ -112,10 +127,28 @@ describe('runPluginDoctorFix', () => {
     expect(calls[0]?.agentDir).toBe('/agent')
   })
 
-  test('rejects absolute paths and ".." segments', () => {
-    const result = sanitizeChangedPaths(['memory/ok.md', '/etc/passwd', '../escape', 'mem/../../oops'])
+  test('rejects absolute paths, ".." segments, ".", null bytes, backslashes, and empty', () => {
+    const result = sanitizeChangedPaths([
+      'memory/ok.md',
+      '/etc/passwd',
+      '../escape',
+      'mem/../../oops',
+      '.',
+      './',
+      'foo/..',
+      '',
+      'has\0null',
+      'win\\path',
+    ])
     expect(result.accepted).toEqual(['memory/ok.md'])
-    expect(result.rejected.sort()).toEqual(['../escape', '/etc/passwd', 'mem/../../oops'])
+    expect(result.rejected.sort()).toEqual(
+      ['', '.', './', '../escape', '/etc/passwd', 'foo/..', 'has\0null', 'mem/../../oops', 'win\\path'].sort(),
+    )
+  })
+
+  test('reduces foo/bar/../baz to foo/baz instead of leaking ".."', () => {
+    const result = sanitizeChangedPaths(['foo/bar/../baz', 'foo/./bar'])
+    expect(result.accepted).toEqual(['foo/baz', 'foo/bar'])
   })
 
   test('returns error when check has no apply callback', async () => {

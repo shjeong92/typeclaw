@@ -54,19 +54,27 @@ export async function runPluginDoctorFix(opts: RunPluginDoctorFixOptions): Promi
   const entry = opts.registry.doctorChecks.find((c) => checkId(c.pluginName, c.checkName) === opts.checkId)
   if (!entry) return { ok: false, error: `doctor check ${opts.checkId} is not registered` }
 
-  const ctx = buildPluginCtx(entry, opts.agentDir)
+  const checkController = new AbortController()
+  const checkCtx = buildPluginCtx(entry, opts.agentDir, checkController.signal)
   let result: PluginCheckResult
   try {
-    result = await raceWithTimeout(entry.check.run(ctx), opts.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS, 'check')
+    result = await raceWithTimeout(
+      entry.check.run(checkCtx),
+      opts.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS,
+      'check',
+      checkController,
+    )
   } catch (err) {
     return { ok: false, error: messageOf(err) }
   }
   const apply = result.fix?.apply
   if (!apply) return { ok: false, error: `${opts.checkId}: no auto-fix available` }
 
+  const fixController = new AbortController()
+  const fixCtx = buildPluginCtx(entry, opts.agentDir, fixController.signal)
   let fix: PluginFixResult
   try {
-    fix = await raceWithTimeout(apply(ctx), opts.fixTimeoutMs ?? DEFAULT_FIX_TIMEOUT_MS, 'fix')
+    fix = await raceWithTimeout(apply(fixCtx), opts.fixTimeoutMs ?? DEFAULT_FIX_TIMEOUT_MS, 'fix', fixController)
   } catch (err) {
     return { ok: false, error: messageOf(err) }
   }
@@ -86,9 +94,10 @@ async function runOneCheck(
   timeoutMs: number,
 ): Promise<PluginCheckRecord> {
   const id = checkId(entry.pluginName, entry.checkName)
-  const ctx = buildPluginCtx(entry, agentDir)
+  const controller = new AbortController()
+  const ctx = buildPluginCtx(entry, agentDir, controller.signal)
   try {
-    const result = await raceWithTimeout(entry.check.run(ctx), timeoutMs, 'check')
+    const result = await raceWithTimeout(entry.check.run(ctx), timeoutMs, 'check', controller)
     return buildRecord(entry, id, result)
   } catch (err) {
     return {
@@ -120,19 +129,28 @@ function buildRecord(entry: RegisteredDoctorCheck, id: string, result: PluginChe
   return record
 }
 
-function buildPluginCtx(entry: RegisteredDoctorCheck, agentDir: string): PluginDoctorContext {
+function buildPluginCtx(entry: RegisteredDoctorCheck, agentDir: string, signal: AbortSignal): PluginDoctorContext {
   return Object.freeze({
     pluginName: entry.pluginName,
     agentDir,
     config: entry.pluginConfig,
     logger: entry.logger,
+    signal,
   })
 }
 
-async function raceWithTimeout<T>(work: Promise<T>, ms: number, label: 'check' | 'fix'): Promise<T> {
+async function raceWithTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  label: 'check' | 'fix',
+  controller: AbortController,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`plugin doctor ${label} timed out after ${ms}ms`)), ms)
+    timer = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`plugin doctor ${label} timed out after ${ms}ms`))
+    }, ms)
   })
   try {
     return await Promise.race([work, timeout])
@@ -148,26 +166,41 @@ function messageOf(err: unknown): string {
 export type PathSanitization = { accepted: string[]; rejected: string[] }
 
 // Plugin fixes declare paths relative to agentDir; the host re-validates on
-// receipt for defense in depth, but rejecting here first keeps the wire
-// payload small and the failure attribution accurate.
+// receipt for defense in depth. The rules here MUST stay identical to the
+// host-side sanitizer in `src/doctor/index.ts` — any plugin-supplied path that
+// would survive normalization to `.` (the agent root), to a `..` escape, or
+// to an absolute filesystem path is rejected so `git add` cannot stage
+// anything outside the explicit fix surface.
 export function sanitizeChangedPaths(paths: readonly string[]): PathSanitization {
   const accepted: string[] = []
   const rejected: string[] = []
   for (const raw of paths) {
-    if (typeof raw !== 'string' || raw.length === 0) {
+    if (typeof raw !== 'string') {
       rejected.push(String(raw))
       continue
     }
-    if (isAbsolute(raw) || raw.includes('\\')) {
+    if (raw.length === 0) {
       rejected.push(raw)
       continue
     }
-    const normalized = normalize(raw)
-    if (normalized.startsWith('..') || normalized.split('/').includes('..')) {
+    if (raw.includes('\0') || raw.includes('\\')) {
       rejected.push(raw)
       continue
     }
-    accepted.push(normalized)
+    if (isAbsolute(raw)) {
+      rejected.push(raw)
+      continue
+    }
+    const stripped = normalize(raw).replace(/\/+$/, '')
+    if (stripped === '.' || stripped === '' || stripped.startsWith('..')) {
+      rejected.push(raw)
+      continue
+    }
+    if (stripped.split('/').includes('..')) {
+      rejected.push(raw)
+      continue
+    }
+    accepted.push(stripped)
   }
   return { accepted, rejected }
 }
